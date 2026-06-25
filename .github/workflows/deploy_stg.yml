@@ -1,13 +1,6 @@
 name: Deploy → Staging (STG)
 
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - "templates/**"
-      - "config/**"
-      - "scripts/**"
   workflow_dispatch:
     inputs:
       dry_run:
