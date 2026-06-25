@@ -1,0 +1,65 @@
+name: Deploy → Production (PROD)
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run only (no Snowflake changes)"
+        type: boolean
+        default: true        # default to safe mode for manual prod deploys
+
+env:
+  ENV: prod
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  render-and-deploy:
+    name: Render & Deploy to PROD
+    runs-on: ubuntu-latest
+    environment: production   # requires a GitHub "production" environment with approval gate
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Render Jinja templates
+        run: python scripts/render.py --env ${{ env.ENV }}
+
+      - name: Upload rendered SQL as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rendered-sql-prod-${{ github.sha }}
+          path: rendered/prod/
+          retention-days: 90
+
+      - name: Deploy to Snowflake PROD
+        run: |
+          python scripts/deploy.py \
+            --env ${{ env.ENV }} \
+            ${{ github.event.inputs.dry_run == 'true' && '--dry-run' || '' }}
+        env:
+          SNOWFLAKE_ACCOUNT:             ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_USER:                ${{ secrets.SNOWFLAKE_USER }}
+          SNOWFLAKE_PRIVATE_KEY_PATH:    ${{ secrets.SNOWFLAKE_PRIVATE_KEY_PATH }}
+          SNOWFLAKE_PRIVATE_KEY_PASSPHRASE: ${{ secrets.SNOWFLAKE_PRIVATE_KEY_PASSPHRASE }}
+          SNOWFLAKE_ROLE:                ${{ secrets.SNOWFLAKE_ROLE_PROD }}
+
+      - name: Deployment summary
+        if: always()
+        run: |
+          echo "### Snowflake PROD Deployment" >> $GITHUB_STEP_SUMMARY
+          echo "- **Environment:** \`${{ env.ENV }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Release:** \`${{ github.event.release.tag_name || github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Triggered by:** ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Dry run:** ${{ github.event.inputs.dry_run || 'false' }}" >> $GITHUB_STEP_SUMMARY

@@ -1,0 +1,22 @@
+{% from 'macros/common.sql.j2' import env_banner %}
+{{ env_banner(env.env_label, env.env_suffix) }}
+
+-- ── TRANSFORM WAREHOUSE ───────────────────────────────────────────────────────
+CREATE WAREHOUSE IF NOT EXISTS {{ env.warehouse.name }}
+    WAREHOUSE_SIZE       = '{{ env.warehouse.size }}'
+    AUTO_SUSPEND         = {{ env.warehouse.auto_suspend }}
+    AUTO_RESUME          = {{ env.warehouse.auto_resume | upper }}
+    INITIALLY_SUSPENDED  = TRUE
+    COMMENT              = 'ELT transformation warehouse for {{ env.env_label }}';
+
+ALTER WAREHOUSE {{ env.warehouse.name }} SET
+    WAREHOUSE_SIZE = '{{ env.warehouse.size }}'
+    AUTO_SUSPEND   = {{ env.warehouse.auto_suspend }};
+
+-- ── REPORTING WAREHOUSE ───────────────────────────────────────────────────────
+CREATE WAREHOUSE IF NOT EXISTS REPORTING_WH{{ env.env_suffix }}
+    WAREHOUSE_SIZE       = 'X-SMALL'
+    AUTO_SUSPEND         = 60
+    AUTO_RESUME          = TRUE
+    INITIALLY_SUSPENDED  = TRUE
+    COMMENT              = 'BI / ad-hoc query warehouse for {{ env.env_label }}';

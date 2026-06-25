@@ -1,0 +1,61 @@
+{% from 'macros/common.sql.j2' import env_banner, fqn %}
+{{ env_banner(env.env_label, env.env_suffix) }}
+
+USE DATABASE {{ env.raw_database }};
+USE SCHEMA   {{ env.schemas.bronze }};
+
+-- ════════════════════════════════════════════════════════════════════════════════
+--  BRONZE LAYER — External stages and file formats
+-- ════════════════════════════════════════════════════════════════════════════════
+
+-- ── FILE FORMATS ──────────────────────────────────────────────────────────────
+CREATE FILE FORMAT IF NOT EXISTS FF_JSON_NDJSON
+    TYPE             = JSON
+    STRIP_OUTER_ARRAY = FALSE
+    COMPRESSION      = AUTO
+    COMMENT          = 'NDJSON (one JSON object per line)';
+
+CREATE FILE FORMAT IF NOT EXISTS FF_CSV_STANDARD
+    TYPE             = CSV
+    FIELD_DELIMITER  = ','
+    RECORD_DELIMITER = '\n'
+    SKIP_HEADER      = 1
+    NULL_IF          = ('NULL', 'null', '')
+    EMPTY_FIELD_AS_NULL = TRUE
+    COMPRESSION      = AUTO;
+
+CREATE FILE FORMAT IF NOT EXISTS FF_PARQUET
+    TYPE             = PARQUET
+    SNAPPY_COMPRESSION = TRUE;
+
+-- ── EXTERNAL STAGE (S3) ───────────────────────────────────────────────────────
+-- Credentials are injected from Snowflake secrets / storage integration
+CREATE STAGE IF NOT EXISTS STG_ECOMMERCE_S3
+    STORAGE_INTEGRATION = S3_INTEGRATION_{{ env.env_suffix | replace('_', '') }}
+    URL                 = 's3://your-bucket-{{ env.env_label }}/ecommerce/'
+    FILE_FORMAT         = FF_JSON_NDJSON
+    COMMENT             = 'Ecommerce raw data landing zone — {{ env.env_label }}';
+
+-- ── SNOWPIPE (continuous ingest) ──────────────────────────────────────────────
+CREATE PIPE IF NOT EXISTS PIPE_RAW_ORDERS
+    AUTO_INGEST = TRUE
+    COMMENT     = 'Continuous ingest for orders — {{ env.env_label }}'
+AS
+COPY INTO {{ fqn(env.raw_database, env.schemas.bronze, 'RAW_ORDERS') }} (
+    ORDER_ID, CUSTOMER_ID, ORDER_STATUS, ORDER_TOTAL,
+    CURRENCY_CODE, SHIPPING_ADDRESS, ORDER_METADATA, CREATED_AT, UPDATED_AT
+)
+FROM (
+    SELECT
+        $1:order_id::VARCHAR(50),
+        $1:customer_id::VARCHAR(50),
+        $1:status::VARCHAR(30),
+        $1:total::NUMBER(18,2),
+        $1:currency::VARCHAR(3),
+        $1:shipping_address::VARIANT,
+        $1::VARIANT,
+        $1:created_at::TIMESTAMP_NTZ,
+        $1:updated_at::TIMESTAMP_NTZ
+    FROM @STG_ECOMMERCE_S3/orders/
+)
+FILE_FORMAT = (FORMAT_NAME = FF_JSON_NDJSON);

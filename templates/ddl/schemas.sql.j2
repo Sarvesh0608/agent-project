@@ -1,0 +1,27 @@
+{% from 'macros/common.sql.j2' import env_banner, apply_tags %}
+{{ env_banner(env.env_label, env.env_suffix) }}
+
+-- ── BRONZE SCHEMA (inside RAW database) ──────────────────────────────────────
+USE DATABASE {{ env.raw_database }};
+
+CREATE SCHEMA IF NOT EXISTS {{ env.schemas.bronze }}
+    DATA_RETENTION_TIME_IN_DAYS = {{ settings.retention.bronze }}
+    COMMENT = 'Raw ingestion schema — exact copies of source data';
+
+{{ apply_tags('SCHEMA', env.raw_database + '.' + env.schemas.bronze, env.tags) }}
+
+-- ── SILVER SCHEMA ─────────────────────────────────────────────────────────────
+USE DATABASE {{ env.database }};
+
+CREATE SCHEMA IF NOT EXISTS {{ env.schemas.silver }}
+    DATA_RETENTION_TIME_IN_DAYS = {{ settings.retention.silver }}
+    COMMENT = 'Cleaned, validated, and conformed data';
+
+{{ apply_tags('SCHEMA', env.database + '.' + env.schemas.silver, env.tags) }}
+
+-- ── GOLD SCHEMA ───────────────────────────────────────────────────────────────
+CREATE SCHEMA IF NOT EXISTS {{ env.schemas.gold }}
+    DATA_RETENTION_TIME_IN_DAYS = {{ settings.retention.gold }}
+    COMMENT = 'Business-ready dimensions, facts, and reports';
+
+{{ apply_tags('SCHEMA', env.database + '.' + env.schemas.gold, env.tags) }}

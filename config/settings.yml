@@ -1,0 +1,26 @@
+# Shared settings across all environments
+project:
+  name: "medallion_analytics"
+  version: "1.0.0"
+  owner: "data-engineering"
+
+# Source system definitions used in bronze stage objects
+sources:
+  - name: "ecommerce"
+    stage_prefix: "ECOMMERCE"
+    tables:
+      - orders
+      - customers
+      - products
+      - order_items
+
+# Retention policies by layer (days)
+retention:
+  bronze: 90
+  silver: 365
+  gold: 730
+
+# Default clustering keys by table pattern
+clustering:
+  orders: ["DATE(CREATED_AT)"]
+  events: ["DATE(EVENT_TIMESTAMP)"]

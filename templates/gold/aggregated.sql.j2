@@ -1,0 +1,145 @@
+{% from 'macros/common.sql.j2' import env_banner, fqn %}
+{{ env_banner(env.env_label, env.env_suffix) }}
+
+USE DATABASE {{ env.database }};
+USE SCHEMA   {{ env.schemas.gold }};
+USE WAREHOUSE {{ env.warehouse.name }};
+
+-- ════════════════════════════════════════════════════════════════════════════════
+--  GOLD LAYER — Business-ready dimensions, facts, and report tables
+--  Strategy: CREATE OR REPLACE for views; incremental INSERT for large facts
+-- ════════════════════════════════════════════════════════════════════════════════
+
+-- ── DIM_CUSTOMER ──────────────────────────────────────────────────────────────
+CREATE OR REPLACE VIEW {{ fqn(env.database, env.schemas.gold, 'DIM_CUSTOMER') }}
+COMMENT = 'Customer dimension — {{ env.env_label }}'
+AS
+SELECT
+    c.CUSTOMER_ID,
+    c.EMAIL_DOMAIN,                  -- email domain safe for analytics; raw email stays in silver
+    c.FIRST_NAME,
+    c.LAST_NAME,
+    c.FULL_NAME,
+    c.AGE_BUCKET,
+    c.SIGNUP_SOURCE,
+    c.CREATED_AT                     AS CUSTOMER_SINCE,
+    c._IS_DELETED                    AS IS_DELETED,
+    -- Derived flags
+    DATEDIFF('day', c.CREATED_AT, CURRENT_TIMESTAMP) AS DAYS_AS_CUSTOMER
+FROM {{ fqn(env.database, env.schemas.silver, 'CUSTOMERS') }} c
+WHERE c._IS_DELETED = FALSE;
+
+-- ── DIM_PRODUCT ───────────────────────────────────────────────────────────────
+CREATE OR REPLACE VIEW {{ fqn(env.database, env.schemas.gold, 'DIM_PRODUCT') }}
+COMMENT = 'Product dimension — {{ env.env_label }}'
+AS
+SELECT
+    PRODUCT_ID,
+    SKU,
+    PRODUCT_NAME,
+    CATEGORY_L1,
+    CATEGORY_L2,
+    UNIT_PRICE_USD,
+    IS_ACTIVE,
+    CREATED_AT                       AS PRODUCT_LAUNCHED_AT
+FROM {{ fqn(env.database, env.schemas.silver, 'PRODUCTS') }};
+
+-- ── FACT_ORDERS ───────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS {{ fqn(env.database, env.schemas.gold, 'FACT_ORDERS') }} (
+    ORDER_ID          VARCHAR(50)    NOT NULL PRIMARY KEY,
+    CUSTOMER_ID       VARCHAR(50)    NOT NULL,
+    ORDER_DATE        DATE           NOT NULL,
+    ORDER_MONTH       VARCHAR(7)     NOT NULL   COMMENT 'YYYY-MM for easy partitioning',
+    ORDER_YEAR        NUMBER(4)      NOT NULL,
+    STATUS_CATEGORY   VARCHAR(20)    NOT NULL,
+    SHIP_COUNTRY      VARCHAR(100),
+    ORDER_TOTAL_USD   NUMBER(18, 2)  NOT NULL,
+    ITEM_COUNT        NUMBER(10, 0)  NOT NULL,
+    GROSS_REVENUE_USD NUMBER(18, 2)  NOT NULL,
+    DISCOUNT_USD      NUMBER(18, 2)  NOT NULL DEFAULT 0,
+    NET_REVENUE_USD   NUMBER(18, 2)  NOT NULL,
+    _LOADED_AT        TIMESTAMP_NTZ  DEFAULT SYSDATE()
+)
+CLUSTER BY (ORDER_DATE, SHIP_COUNTRY)
+DATA_RETENTION_TIME_IN_DAYS = {{ settings.retention.gold }}
+COMMENT = 'Order fact table — {{ env.env_label }}';
+
+-- Incremental load (only new/updated orders)
+MERGE INTO {{ fqn(env.database, env.schemas.gold, 'FACT_ORDERS') }} AS tgt
+USING (
+    SELECT
+        o.ORDER_ID,
+        o.CUSTOMER_ID,
+        DATE(o.CREATED_AT)                               AS ORDER_DATE,
+        TO_VARCHAR(DATE(o.CREATED_AT), 'YYYY-MM')        AS ORDER_MONTH,
+        YEAR(o.CREATED_AT)                               AS ORDER_YEAR,
+        o.STATUS_CATEGORY,
+        o.SHIP_COUNTRY,
+        o.ORDER_TOTAL_USD,
+        COUNT(oi.ORDER_ITEM_ID)                          AS ITEM_COUNT,
+        SUM(oi.QUANTITY * oi.UNIT_PRICE_USD)             AS GROSS_REVENUE_USD,
+        SUM(oi.DISCOUNT_AMOUNT)                          AS DISCOUNT_USD,
+        SUM(oi.LINE_TOTAL_USD)                           AS NET_REVENUE_USD
+    FROM {{ fqn(env.database, env.schemas.silver, 'ORDERS') }} o
+    LEFT JOIN {{ fqn(env.database, env.schemas.silver, 'ORDER_ITEMS') }} oi
+        ON oi.ORDER_ID = o.ORDER_ID
+    GROUP BY 1, 2, 3, 4, 5, 6, 7, 8
+) AS src ON src.ORDER_ID = tgt.ORDER_ID
+WHEN MATCHED THEN UPDATE SET
+    tgt.STATUS_CATEGORY   = src.STATUS_CATEGORY,
+    tgt.GROSS_REVENUE_USD = src.GROSS_REVENUE_USD,
+    tgt.DISCOUNT_USD      = src.DISCOUNT_USD,
+    tgt.NET_REVENUE_USD   = src.NET_REVENUE_USD,
+    tgt._LOADED_AT        = SYSDATE()
+WHEN NOT MATCHED THEN INSERT
+    VALUES (src.ORDER_ID, src.CUSTOMER_ID, src.ORDER_DATE, src.ORDER_MONTH,
+            src.ORDER_YEAR, src.STATUS_CATEGORY, src.SHIP_COUNTRY, src.ORDER_TOTAL_USD,
+            src.ITEM_COUNT, src.GROSS_REVENUE_USD, src.DISCOUNT_USD, src.NET_REVENUE_USD,
+            SYSDATE());
+
+-- ── RPT_DAILY_SALES ───────────────────────────────────────────────────────────
+CREATE OR REPLACE VIEW {{ fqn(env.database, env.schemas.gold, 'RPT_DAILY_SALES') }}
+COMMENT = 'Daily sales summary — {{ env.env_label }}'
+AS
+SELECT
+    ORDER_DATE,
+    ORDER_MONTH,
+    ORDER_YEAR,
+    SHIP_COUNTRY,
+    COUNT(DISTINCT ORDER_ID)         AS TOTAL_ORDERS,
+    COUNT(DISTINCT CUSTOMER_ID)      AS UNIQUE_CUSTOMERS,
+    SUM(ITEM_COUNT)                  AS TOTAL_ITEMS_SOLD,
+    SUM(GROSS_REVENUE_USD)           AS GROSS_REVENUE_USD,
+    SUM(DISCOUNT_USD)                AS TOTAL_DISCOUNTS_USD,
+    SUM(NET_REVENUE_USD)             AS NET_REVENUE_USD,
+    AVG(NET_REVENUE_USD)             AS AVG_ORDER_VALUE_USD,
+    SUM(CASE WHEN STATUS_CATEGORY = 'CANCELLED' THEN NET_REVENUE_USD ELSE 0 END) AS CANCELLED_REVENUE_USD
+FROM {{ fqn(env.database, env.schemas.gold, 'FACT_ORDERS') }}
+GROUP BY 1, 2, 3, 4;
+
+-- ── RPT_CUSTOMER_LIFETIME_VALUE ───────────────────────────────────────────────
+CREATE OR REPLACE VIEW {{ fqn(env.database, env.schemas.gold, 'RPT_CUSTOMER_LIFETIME_VALUE') }}
+COMMENT = 'Customer lifetime value summary — {{ env.env_label }}'
+AS
+SELECT
+    f.CUSTOMER_ID,
+    c.EMAIL_DOMAIN,
+    c.AGE_BUCKET,
+    c.SIGNUP_SOURCE,
+    c.CUSTOMER_SINCE,
+    c.DAYS_AS_CUSTOMER,
+    COUNT(DISTINCT f.ORDER_ID)       AS TOTAL_ORDERS,
+    SUM(f.NET_REVENUE_USD)           AS LIFETIME_VALUE_USD,
+    AVG(f.NET_REVENUE_USD)           AS AVG_ORDER_VALUE_USD,
+    MIN(f.ORDER_DATE)                AS FIRST_ORDER_DATE,
+    MAX(f.ORDER_DATE)                AS LAST_ORDER_DATE,
+    DATEDIFF('day', MIN(f.ORDER_DATE), MAX(f.ORDER_DATE)) AS CUSTOMER_LIFESPAN_DAYS,
+    -- Orders per month (activity rate)
+    IFF(NULLIF(c.DAYS_AS_CUSTOMER, 0) IS NOT NULL,
+        COUNT(DISTINCT f.ORDER_ID) / (c.DAYS_AS_CUSTOMER / 30.0),
+        0)                           AS ORDERS_PER_MONTH
+FROM {{ fqn(env.database, env.schemas.gold, 'FACT_ORDERS') }} f
+JOIN {{ fqn(env.database, env.schemas.gold, 'DIM_CUSTOMER') }} c
+    ON c.CUSTOMER_ID = f.CUSTOMER_ID
+WHERE f.STATUS_CATEGORY != 'CANCELLED'
+GROUP BY 1, 2, 3, 4, 5, 6;

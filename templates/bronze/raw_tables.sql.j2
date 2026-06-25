@@ -1,0 +1,79 @@
+{% from 'macros/common.sql.j2' import env_banner, audit_columns, fqn %}
+{{ env_banner(env.env_label, env.env_suffix) }}
+
+USE DATABASE {{ env.raw_database }};
+USE SCHEMA   {{ env.schemas.bronze }};
+USE WAREHOUSE {{ env.warehouse.name }};
+
+-- ════════════════════════════════════════════════════════════════════════════════
+--  BRONZE LAYER — Raw ingestion tables
+--  Strategy: exact mirror of source, append-only, never transformed here
+-- ════════════════════════════════════════════════════════════════════════════════
+
+-- ── RAW_ORDERS ────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS {{ fqn(env.raw_database, env.schemas.bronze, 'RAW_ORDERS') }} (
+    ORDER_ID          VARCHAR(50)       COMMENT 'Source order identifier',
+    CUSTOMER_ID       VARCHAR(50)       COMMENT 'Foreign key to customer',
+    ORDER_STATUS      VARCHAR(30)       COMMENT 'Raw status string from source',
+    ORDER_TOTAL       NUMBER(18, 2)     COMMENT 'Total order value in source currency',
+    CURRENCY_CODE     VARCHAR(3)        COMMENT 'ISO 4217 currency code',
+    SHIPPING_ADDRESS  VARIANT           COMMENT 'Full shipping address as JSON blob',
+    ORDER_METADATA    VARIANT           COMMENT 'Catch-all JSON for evolving source fields',
+    CREATED_AT        TIMESTAMP_NTZ     COMMENT 'Order creation timestamp (source TZ)',
+    UPDATED_AT        TIMESTAMP_NTZ     COMMENT 'Last update timestamp (source TZ)',
+    {{ audit_columns() }}
+)
+CLUSTER BY (DATE(CREATED_AT))
+DATA_RETENTION_TIME_IN_DAYS = {{ settings.retention.bronze }}
+COMMENT = 'Raw orders from ecommerce source — {{ env.env_label }}';
+
+-- ── RAW_CUSTOMERS ─────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS {{ fqn(env.raw_database, env.schemas.bronze, 'RAW_CUSTOMERS') }} (
+    CUSTOMER_ID       VARCHAR(50)       COMMENT 'Source customer identifier',
+    EMAIL             VARCHAR(255)      COMMENT 'Customer email (may contain PII)',
+    FIRST_NAME        VARCHAR(100),
+    LAST_NAME         VARCHAR(100),
+    PHONE             VARCHAR(30),
+    DATE_OF_BIRTH     DATE,
+    SIGNUP_SOURCE     VARCHAR(100)      COMMENT 'Acquisition channel',
+    CUSTOMER_METADATA VARIANT           COMMENT 'Catch-all JSON for evolving fields',
+    CREATED_AT        TIMESTAMP_NTZ,
+    UPDATED_AT        TIMESTAMP_NTZ,
+    {{ audit_columns() }}
+)
+DATA_RETENTION_TIME_IN_DAYS = {{ settings.retention.bronze }}
+COMMENT = 'Raw customers from ecommerce source — {{ env.env_label }}';
+
+-- ── RAW_PRODUCTS ──────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS {{ fqn(env.raw_database, env.schemas.bronze, 'RAW_PRODUCTS') }} (
+    PRODUCT_ID        VARCHAR(50),
+    SKU               VARCHAR(100),
+    PRODUCT_NAME      VARCHAR(500),
+    CATEGORY          VARCHAR(200),
+    SUBCATEGORY       VARCHAR(200),
+    UNIT_PRICE        NUMBER(18, 4),
+    CURRENCY_CODE     VARCHAR(3),
+    IS_ACTIVE         BOOLEAN,
+    PRODUCT_METADATA  VARIANT,
+    CREATED_AT        TIMESTAMP_NTZ,
+    UPDATED_AT        TIMESTAMP_NTZ,
+    {{ audit_columns() }}
+)
+DATA_RETENTION_TIME_IN_DAYS = {{ settings.retention.bronze }}
+COMMENT = 'Raw product catalog from ecommerce source — {{ env.env_label }}';
+
+-- ── RAW_ORDER_ITEMS ───────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS {{ fqn(env.raw_database, env.schemas.bronze, 'RAW_ORDER_ITEMS') }} (
+    ORDER_ITEM_ID     VARCHAR(50),
+    ORDER_ID          VARCHAR(50),
+    PRODUCT_ID        VARCHAR(50),
+    QUANTITY          NUMBER(10, 0),
+    UNIT_PRICE        NUMBER(18, 4),
+    DISCOUNT_AMOUNT   NUMBER(18, 4)  DEFAULT 0,
+    LINE_TOTAL        NUMBER(18, 4),
+    CREATED_AT        TIMESTAMP_NTZ,
+    {{ audit_columns() }}
+)
+CLUSTER BY (DATE(CREATED_AT))
+DATA_RETENTION_TIME_IN_DAYS = {{ settings.retention.bronze }}
+COMMENT = 'Raw order line items — {{ env.env_label }}';

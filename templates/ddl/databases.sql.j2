@@ -1,0 +1,16 @@
+{% from 'macros/common.sql.j2' import env_banner, apply_tags %}
+{{ env_banner(env.env_label, env.env_suffix) }}
+
+-- ── RAW DATABASE ──────────────────────────────────────────────────────────────
+CREATE DATABASE IF NOT EXISTS {{ env.raw_database }}
+    DATA_RETENTION_TIME_IN_DAYS = {{ settings.retention.bronze }}
+    COMMENT = 'Bronze/raw ingestion layer for {{ env.env_label }}';
+
+{{ apply_tags('DATABASE', env.raw_database, env.tags) }}
+
+-- ── ANALYTICS DATABASE ────────────────────────────────────────────────────────
+CREATE DATABASE IF NOT EXISTS {{ env.database }}
+    DATA_RETENTION_TIME_IN_DAYS = {{ settings.retention.gold }}
+    COMMENT = 'Silver and Gold analytics layers for {{ env.env_label }}';
+
+{{ apply_tags('DATABASE', env.database, env.tags) }}

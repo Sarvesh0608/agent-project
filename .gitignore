@@ -1,0 +1,13 @@
+# Rendered SQL (generated artifacts — not source-controlled)
+rendered/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.env
+
+# Snowflake private keys
+*.p8
+*.pem
+*.key

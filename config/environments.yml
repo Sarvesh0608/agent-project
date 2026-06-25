@@ -1,0 +1,52 @@
+environments:
+  stg:
+    env_suffix: "_STG"
+    env_label: "staging"
+    database: "ANALYTICS_STG"
+    raw_database: "RAW_STG"
+    warehouse:
+      name: "TRANSFORM_WH_STG"
+      size: "X-SMALL"
+      auto_suspend: 60
+      auto_resume: true
+    roles:
+      admin: "SYSADMIN_STG"
+      transformer: "TRANSFORMER_STG"
+      reporter: "REPORTER_STG"
+    schemas:
+      bronze: "BRONZE"
+      silver: "SILVER"
+      gold: "GOLD"
+    tags:
+      environment: "staging"
+      managed_by: "github-actions"
+    snowflake:
+      account: "{{ env('SNOWFLAKE_ACCOUNT') }}"
+      user: "{{ env('SNOWFLAKE_USER') }}"
+      role: "SYSADMIN"
+
+  prod:
+    env_suffix: "_PROD"
+    env_label: "production"
+    database: "ANALYTICS_PROD"
+    raw_database: "RAW_PROD"
+    warehouse:
+      name: "TRANSFORM_WH_PROD"
+      size: "SMALL"
+      auto_suspend: 120
+      auto_resume: true
+    roles:
+      admin: "SYSADMIN_PROD"
+      transformer: "TRANSFORMER_PROD"
+      reporter: "REPORTER_PROD"
+    schemas:
+      bronze: "BRONZE"
+      silver: "SILVER"
+      gold: "GOLD"
+    tags:
+      environment: "production"
+      managed_by: "github-actions"
+    snowflake:
+      account: "{{ env('SNOWFLAKE_ACCOUNT') }}"
+      user: "{{ env('SNOWFLAKE_USER') }}"
+      role: "SYSADMIN"

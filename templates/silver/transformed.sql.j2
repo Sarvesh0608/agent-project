@@ -1,0 +1,234 @@
+{% from 'macros/common.sql.j2' import env_banner, scd1_columns, fqn %}
+{{ env_banner(env.env_label, env.env_suffix) }}
+
+USE DATABASE {{ env.database }};
+USE SCHEMA   {{ env.schemas.silver }};
+USE WAREHOUSE {{ env.warehouse.name }};
+
+-- ════════════════════════════════════════════════════════════════════════════════
+--  SILVER LAYER — Cleaned, validated, and conformed tables
+--  Strategy: deduplicated, typed, standardized, no business logic
+-- ════════════════════════════════════════════════════════════════════════════════
+
+-- ── ORDERS ────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS {{ fqn(env.database, env.schemas.silver, 'ORDERS') }} (
+    ORDER_ID          VARCHAR(50)    NOT NULL PRIMARY KEY,
+    CUSTOMER_ID       VARCHAR(50)    NOT NULL,
+    ORDER_STATUS      VARCHAR(30)    NOT NULL,
+    -- Normalized status codes (maps messy source strings to a controlled vocab)
+    STATUS_CATEGORY   VARCHAR(20)    NOT NULL  COMMENT 'PENDING|PROCESSING|SHIPPED|DELIVERED|CANCELLED',
+    ORDER_TOTAL_USD   NUMBER(18, 2)  NOT NULL,
+    CURRENCY_CODE     VARCHAR(3)     NOT NULL,
+    EXCHANGE_RATE     NUMBER(12, 6)           COMMENT 'Rate to USD at order time',
+    SHIP_COUNTRY      VARCHAR(100),
+    SHIP_STATE        VARCHAR(100),
+    SHIP_CITY         VARCHAR(200),
+    SHIP_POSTAL_CODE  VARCHAR(20),
+    CREATED_AT        TIMESTAMP_NTZ  NOT NULL,
+    UPDATED_AT        TIMESTAMP_NTZ  NOT NULL,
+    {{ scd1_columns() }}
+)
+CLUSTER BY (DATE(CREATED_AT))
+DATA_RETENTION_TIME_IN_DAYS = {{ settings.retention.silver }}
+COMMENT = 'Cleaned orders — {{ env.env_label }}';
+
+-- Merge from bronze (idempotent upsert)
+MERGE INTO {{ fqn(env.database, env.schemas.silver, 'ORDERS') }} AS tgt
+USING (
+    SELECT
+        ORDER_ID,
+        CUSTOMER_ID,
+        UPPER(TRIM(ORDER_STATUS))                             AS ORDER_STATUS,
+        CASE
+            WHEN UPPER(TRIM(ORDER_STATUS)) IN ('NEW','PENDING','AWAITING_PAYMENT') THEN 'PENDING'
+            WHEN UPPER(TRIM(ORDER_STATUS)) IN ('PROCESSING','IN_PROGRESS')         THEN 'PROCESSING'
+            WHEN UPPER(TRIM(ORDER_STATUS)) IN ('SHIPPED','IN_TRANSIT','DISPATCHED') THEN 'SHIPPED'
+            WHEN UPPER(TRIM(ORDER_STATUS)) IN ('DELIVERED','COMPLETE','COMPLETED')  THEN 'DELIVERED'
+            WHEN UPPER(TRIM(ORDER_STATUS)) IN ('CANCELLED','CANCELED','REFUNDED')   THEN 'CANCELLED'
+            ELSE 'UNKNOWN'
+        END                                                    AS STATUS_CATEGORY,
+        ORDER_TOTAL                                            AS ORDER_TOTAL_USD,
+        COALESCE(CURRENCY_CODE, 'USD')                         AS CURRENCY_CODE,
+        1.0                                                    AS EXCHANGE_RATE,
+        SHIPPING_ADDRESS:country::VARCHAR(100)                 AS SHIP_COUNTRY,
+        SHIPPING_ADDRESS:state::VARCHAR(100)                   AS SHIP_STATE,
+        SHIPPING_ADDRESS:city::VARCHAR(200)                    AS SHIP_CITY,
+        SHIPPING_ADDRESS:postal_code::VARCHAR(20)              AS SHIP_POSTAL_CODE,
+        CREATED_AT,
+        UPDATED_AT,
+        ROW_NUMBER() OVER (PARTITION BY ORDER_ID ORDER BY _LOADED_AT DESC) AS rn
+    FROM {{ fqn(env.raw_database, env.schemas.bronze, 'RAW_ORDERS') }}
+    WHERE ORDER_ID IS NOT NULL
+) AS src ON src.ORDER_ID = tgt.ORDER_ID AND src.rn = 1
+WHEN MATCHED AND src.UPDATED_AT > tgt.UPDATED_AT THEN UPDATE SET
+    tgt.ORDER_STATUS      = src.ORDER_STATUS,
+    tgt.STATUS_CATEGORY   = src.STATUS_CATEGORY,
+    tgt.ORDER_TOTAL_USD   = src.ORDER_TOTAL_USD,
+    tgt.SHIP_COUNTRY      = src.SHIP_COUNTRY,
+    tgt.SHIP_STATE        = src.SHIP_STATE,
+    tgt.SHIP_CITY         = src.SHIP_CITY,
+    tgt.SHIP_POSTAL_CODE  = src.SHIP_POSTAL_CODE,
+    tgt.UPDATED_AT        = src.UPDATED_AT,
+    tgt._UPDATED_AT       = SYSDATE()
+WHEN NOT MATCHED THEN INSERT (
+    ORDER_ID, CUSTOMER_ID, ORDER_STATUS, STATUS_CATEGORY,
+    ORDER_TOTAL_USD, CURRENCY_CODE, EXCHANGE_RATE,
+    SHIP_COUNTRY, SHIP_STATE, SHIP_CITY, SHIP_POSTAL_CODE,
+    CREATED_AT, UPDATED_AT
+) VALUES (
+    src.ORDER_ID, src.CUSTOMER_ID, src.ORDER_STATUS, src.STATUS_CATEGORY,
+    src.ORDER_TOTAL_USD, src.CURRENCY_CODE, src.EXCHANGE_RATE,
+    src.SHIP_COUNTRY, src.SHIP_STATE, src.SHIP_CITY, src.SHIP_POSTAL_CODE,
+    src.CREATED_AT, src.UPDATED_AT
+);
+
+-- ── CUSTOMERS ─────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS {{ fqn(env.database, env.schemas.silver, 'CUSTOMERS') }} (
+    CUSTOMER_ID       VARCHAR(50)    NOT NULL PRIMARY KEY,
+    EMAIL             VARCHAR(255)   NOT NULL,
+    EMAIL_DOMAIN      VARCHAR(255)             COMMENT 'Derived from email, safe to use without PII masking',
+    FIRST_NAME        VARCHAR(100),
+    LAST_NAME         VARCHAR(100),
+    FULL_NAME         VARCHAR(200),
+    PHONE_CLEAN       VARCHAR(20)              COMMENT 'E.164 normalized phone',
+    BIRTH_YEAR        NUMBER(4)                COMMENT 'Year only — avoid storing exact DOB downstream',
+    AGE_BUCKET        VARCHAR(20)              COMMENT '18-24|25-34|35-44|45-54|55-64|65+',
+    SIGNUP_SOURCE     VARCHAR(100),
+    CREATED_AT        TIMESTAMP_NTZ  NOT NULL,
+    UPDATED_AT        TIMESTAMP_NTZ  NOT NULL,
+    {{ scd1_columns() }}
+)
+DATA_RETENTION_TIME_IN_DAYS = {{ settings.retention.silver }}
+COMMENT = 'Cleaned customers — {{ env.env_label }}';
+
+MERGE INTO {{ fqn(env.database, env.schemas.silver, 'CUSTOMERS') }} AS tgt
+USING (
+    SELECT
+        CUSTOMER_ID,
+        LOWER(TRIM(EMAIL))                                        AS EMAIL,
+        SPLIT_PART(LOWER(TRIM(EMAIL)), '@', 2)                    AS EMAIL_DOMAIN,
+        INITCAP(TRIM(FIRST_NAME))                                 AS FIRST_NAME,
+        INITCAP(TRIM(LAST_NAME))                                  AS LAST_NAME,
+        TRIM(INITCAP(TRIM(FIRST_NAME)) || ' ' || INITCAP(TRIM(LAST_NAME))) AS FULL_NAME,
+        REGEXP_REPLACE(PHONE, '[^0-9+]', '')                      AS PHONE_CLEAN,
+        YEAR(DATE_OF_BIRTH)                                       AS BIRTH_YEAR,
+        CASE
+            WHEN DATEDIFF('year', DATE_OF_BIRTH, CURRENT_DATE) BETWEEN 18 AND 24 THEN '18-24'
+            WHEN DATEDIFF('year', DATE_OF_BIRTH, CURRENT_DATE) BETWEEN 25 AND 34 THEN '25-34'
+            WHEN DATEDIFF('year', DATE_OF_BIRTH, CURRENT_DATE) BETWEEN 35 AND 44 THEN '35-44'
+            WHEN DATEDIFF('year', DATE_OF_BIRTH, CURRENT_DATE) BETWEEN 45 AND 54 THEN '45-54'
+            WHEN DATEDIFF('year', DATE_OF_BIRTH, CURRENT_DATE) BETWEEN 55 AND 64 THEN '55-64'
+            WHEN DATEDIFF('year', DATE_OF_BIRTH, CURRENT_DATE) >= 65             THEN '65+'
+            ELSE 'UNKNOWN'
+        END                                                        AS AGE_BUCKET,
+        SIGNUP_SOURCE,
+        CREATED_AT,
+        UPDATED_AT,
+        ROW_NUMBER() OVER (PARTITION BY CUSTOMER_ID ORDER BY _LOADED_AT DESC) AS rn
+    FROM {{ fqn(env.raw_database, env.schemas.bronze, 'RAW_CUSTOMERS') }}
+    WHERE CUSTOMER_ID IS NOT NULL AND EMAIL IS NOT NULL
+) AS src ON src.CUSTOMER_ID = tgt.CUSTOMER_ID AND src.rn = 1
+WHEN MATCHED AND src.UPDATED_AT > tgt.UPDATED_AT THEN UPDATE SET
+    tgt.EMAIL          = src.EMAIL,
+    tgt.EMAIL_DOMAIN   = src.EMAIL_DOMAIN,
+    tgt.FIRST_NAME     = src.FIRST_NAME,
+    tgt.LAST_NAME      = src.LAST_NAME,
+    tgt.FULL_NAME      = src.FULL_NAME,
+    tgt.PHONE_CLEAN    = src.PHONE_CLEAN,
+    tgt.UPDATED_AT     = src.UPDATED_AT,
+    tgt._UPDATED_AT    = SYSDATE()
+WHEN NOT MATCHED THEN INSERT (
+    CUSTOMER_ID, EMAIL, EMAIL_DOMAIN, FIRST_NAME, LAST_NAME, FULL_NAME,
+    PHONE_CLEAN, BIRTH_YEAR, AGE_BUCKET, SIGNUP_SOURCE, CREATED_AT, UPDATED_AT
+) VALUES (
+    src.CUSTOMER_ID, src.EMAIL, src.EMAIL_DOMAIN, src.FIRST_NAME, src.LAST_NAME, src.FULL_NAME,
+    src.PHONE_CLEAN, src.BIRTH_YEAR, src.AGE_BUCKET, src.SIGNUP_SOURCE, src.CREATED_AT, src.UPDATED_AT
+);
+
+-- ── PRODUCTS ──────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS {{ fqn(env.database, env.schemas.silver, 'PRODUCTS') }} (
+    PRODUCT_ID        VARCHAR(50)    NOT NULL PRIMARY KEY,
+    SKU               VARCHAR(100)   NOT NULL,
+    PRODUCT_NAME      VARCHAR(500)   NOT NULL,
+    CATEGORY_L1       VARCHAR(200),
+    CATEGORY_L2       VARCHAR(200),
+    UNIT_PRICE_USD    NUMBER(18, 4)  NOT NULL,
+    IS_ACTIVE         BOOLEAN        NOT NULL DEFAULT TRUE,
+    CREATED_AT        TIMESTAMP_NTZ  NOT NULL,
+    UPDATED_AT        TIMESTAMP_NTZ  NOT NULL,
+    {{ scd1_columns() }}
+)
+DATA_RETENTION_TIME_IN_DAYS = {{ settings.retention.silver }}
+COMMENT = 'Cleaned product catalog — {{ env.env_label }}';
+
+MERGE INTO {{ fqn(env.database, env.schemas.silver, 'PRODUCTS') }} AS tgt
+USING (
+    SELECT
+        PRODUCT_ID,
+        UPPER(TRIM(SKU))                                AS SKU,
+        TRIM(PRODUCT_NAME)                              AS PRODUCT_NAME,
+        INITCAP(TRIM(CATEGORY))                         AS CATEGORY_L1,
+        INITCAP(TRIM(SUBCATEGORY))                      AS CATEGORY_L2,
+        UNIT_PRICE                                      AS UNIT_PRICE_USD,
+        COALESCE(IS_ACTIVE, TRUE)                       AS IS_ACTIVE,
+        CREATED_AT,
+        UPDATED_AT,
+        ROW_NUMBER() OVER (PARTITION BY PRODUCT_ID ORDER BY _LOADED_AT DESC) AS rn
+    FROM {{ fqn(env.raw_database, env.schemas.bronze, 'RAW_PRODUCTS') }}
+    WHERE PRODUCT_ID IS NOT NULL AND SKU IS NOT NULL
+) AS src ON src.PRODUCT_ID = tgt.PRODUCT_ID AND src.rn = 1
+WHEN MATCHED AND src.UPDATED_AT > tgt.UPDATED_AT THEN UPDATE SET
+    tgt.SKU            = src.SKU,
+    tgt.PRODUCT_NAME   = src.PRODUCT_NAME,
+    tgt.CATEGORY_L1    = src.CATEGORY_L1,
+    tgt.CATEGORY_L2    = src.CATEGORY_L2,
+    tgt.UNIT_PRICE_USD = src.UNIT_PRICE_USD,
+    tgt.IS_ACTIVE      = src.IS_ACTIVE,
+    tgt.UPDATED_AT     = src.UPDATED_AT,
+    tgt._UPDATED_AT    = SYSDATE()
+WHEN NOT MATCHED THEN INSERT (
+    PRODUCT_ID, SKU, PRODUCT_NAME, CATEGORY_L1, CATEGORY_L2,
+    UNIT_PRICE_USD, IS_ACTIVE, CREATED_AT, UPDATED_AT
+) VALUES (
+    src.PRODUCT_ID, src.SKU, src.PRODUCT_NAME, src.CATEGORY_L1, src.CATEGORY_L2,
+    src.UNIT_PRICE_USD, src.IS_ACTIVE, src.CREATED_AT, src.UPDATED_AT
+);
+
+-- ── ORDER_ITEMS ───────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS {{ fqn(env.database, env.schemas.silver, 'ORDER_ITEMS') }} (
+    ORDER_ITEM_ID     VARCHAR(50)    NOT NULL PRIMARY KEY,
+    ORDER_ID          VARCHAR(50)    NOT NULL,
+    PRODUCT_ID        VARCHAR(50)    NOT NULL,
+    QUANTITY          NUMBER(10, 0)  NOT NULL,
+    UNIT_PRICE_USD    NUMBER(18, 4)  NOT NULL,
+    DISCOUNT_AMOUNT   NUMBER(18, 4)  NOT NULL DEFAULT 0,
+    LINE_TOTAL_USD    NUMBER(18, 4)  NOT NULL,
+    CREATED_AT        TIMESTAMP_NTZ  NOT NULL,
+    {{ scd1_columns() }}
+)
+CLUSTER BY (DATE(CREATED_AT))
+DATA_RETENTION_TIME_IN_DAYS = {{ settings.retention.silver }}
+COMMENT = 'Cleaned order line items — {{ env.env_label }}';
+
+MERGE INTO {{ fqn(env.database, env.schemas.silver, 'ORDER_ITEMS') }} AS tgt
+USING (
+    SELECT
+        ORDER_ITEM_ID,
+        ORDER_ID,
+        PRODUCT_ID,
+        QUANTITY,
+        UNIT_PRICE                              AS UNIT_PRICE_USD,
+        COALESCE(DISCOUNT_AMOUNT, 0)            AS DISCOUNT_AMOUNT,
+        QUANTITY * UNIT_PRICE - COALESCE(DISCOUNT_AMOUNT, 0) AS LINE_TOTAL_USD,
+        CREATED_AT,
+        ROW_NUMBER() OVER (PARTITION BY ORDER_ITEM_ID ORDER BY _LOADED_AT DESC) AS rn
+    FROM {{ fqn(env.raw_database, env.schemas.bronze, 'RAW_ORDER_ITEMS') }}
+    WHERE ORDER_ITEM_ID IS NOT NULL AND ORDER_ID IS NOT NULL
+) AS src ON src.ORDER_ITEM_ID = tgt.ORDER_ITEM_ID AND src.rn = 1
+WHEN NOT MATCHED THEN INSERT (
+    ORDER_ITEM_ID, ORDER_ID, PRODUCT_ID, QUANTITY,
+    UNIT_PRICE_USD, DISCOUNT_AMOUNT, LINE_TOTAL_USD, CREATED_AT
+) VALUES (
+    src.ORDER_ITEM_ID, src.ORDER_ID, src.PRODUCT_ID, src.QUANTITY,
+    src.UNIT_PRICE_USD, src.DISCOUNT_AMOUNT, src.LINE_TOTAL_USD, src.CREATED_AT
+);

@@ -1,0 +1,47 @@
+{% from 'macros/common.sql.j2' import env_banner %}
+{{ env_banner(env.env_label, env.env_suffix) }}
+
+-- ── ROLES ─────────────────────────────────────────────────────────────────────
+CREATE ROLE IF NOT EXISTS {{ env.roles.transformer }}
+    COMMENT = 'ELT pipeline role for {{ env.env_label }}';
+
+CREATE ROLE IF NOT EXISTS {{ env.roles.reporter }}
+    COMMENT = 'Read-only BI/analyst role for {{ env.env_label }}';
+
+-- ── WAREHOUSE GRANTS ──────────────────────────────────────────────────────────
+GRANT USAGE ON WAREHOUSE {{ env.warehouse.name }}
+    TO ROLE {{ env.roles.transformer }};
+
+GRANT USAGE ON WAREHOUSE REPORTING_WH{{ env.env_suffix }}
+    TO ROLE {{ env.roles.reporter }};
+
+-- ── DATABASE GRANTS ───────────────────────────────────────────────────────────
+-- Transformer: full access to raw database
+GRANT ALL PRIVILEGES ON DATABASE {{ env.raw_database }}
+    TO ROLE {{ env.roles.transformer }};
+GRANT ALL PRIVILEGES ON ALL SCHEMAS IN DATABASE {{ env.raw_database }}
+    TO ROLE {{ env.roles.transformer }};
+GRANT ALL PRIVILEGES ON ALL TABLES IN DATABASE {{ env.raw_database }}
+    TO ROLE {{ env.roles.transformer }};
+
+-- Transformer: write access to analytics database
+GRANT ALL PRIVILEGES ON DATABASE {{ env.database }}
+    TO ROLE {{ env.roles.transformer }};
+GRANT ALL PRIVILEGES ON ALL SCHEMAS IN DATABASE {{ env.database }}
+    TO ROLE {{ env.roles.transformer }};
+GRANT ALL PRIVILEGES ON ALL TABLES IN DATABASE {{ env.database }}
+    TO ROLE {{ env.roles.transformer }};
+
+-- Reporter: read-only on gold schema only
+GRANT USAGE ON DATABASE {{ env.database }}
+    TO ROLE {{ env.roles.reporter }};
+GRANT USAGE ON SCHEMA {{ env.database }}.{{ env.schemas.gold }}
+    TO ROLE {{ env.roles.reporter }};
+GRANT SELECT ON ALL TABLES IN SCHEMA {{ env.database }}.{{ env.schemas.gold }}
+    TO ROLE {{ env.roles.reporter }};
+GRANT SELECT ON FUTURE TABLES IN SCHEMA {{ env.database }}.{{ env.schemas.gold }}
+    TO ROLE {{ env.roles.reporter }};
+GRANT SELECT ON ALL VIEWS IN SCHEMA {{ env.database }}.{{ env.schemas.gold }}
+    TO ROLE {{ env.roles.reporter }};
+GRANT SELECT ON FUTURE VIEWS IN SCHEMA {{ env.database }}.{{ env.schemas.gold }}
+    TO ROLE {{ env.roles.reporter }};

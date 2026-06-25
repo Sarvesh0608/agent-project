@@ -1,0 +1,40 @@
+{#- ============================================================
+    Common Jinja macros shared across all SQL templates
+    ============================================================ #}
+
+{#- Fully-qualified object name helper -#}
+{%- macro fqn(database, schema, table) -%}
+    {{ database }}.{{ schema }}.{{ table }}
+{%- endmacro -%}
+
+{#- Standard audit columns added to every managed table -#}
+{%- macro audit_columns() %}
+    _LOADED_AT        TIMESTAMP_NTZ DEFAULT SYSDATE()    COMMENT 'Row load timestamp',
+    _SOURCE_FILE      VARCHAR(500)                        COMMENT 'Source file or stream name',
+    _BATCH_ID         VARCHAR(100)                        COMMENT 'Pipeline batch identifier',
+    _RECORD_HASH      VARCHAR(64)                         COMMENT 'MD5 hash for dedup'
+{%- endmacro -%}
+
+{#- SCD Type 1 audit columns for silver layer -#}
+{%- macro scd1_columns() %}
+    _CREATED_AT       TIMESTAMP_NTZ DEFAULT SYSDATE()    COMMENT 'First seen timestamp',
+    _UPDATED_AT       TIMESTAMP_NTZ DEFAULT SYSDATE()    COMMENT 'Last updated timestamp',
+    _IS_DELETED       BOOLEAN       DEFAULT FALSE         COMMENT 'Soft delete flag'
+{%- endmacro -%}
+
+{#- Environment-specific comment banner -#}
+{%- macro env_banner(env_label, env_suffix) %}
+-- ================================================================
+-- Environment : {{ env_label | upper }}
+-- Suffix      : {{ env_suffix }}
+-- Generated   : {{ now }}
+-- DO NOT EDIT : This file is auto-generated from Jinja templates
+-- ================================================================
+{%- endmacro -%}
+
+{#- Tag a Snowflake object after creation -#}
+{%- macro apply_tags(object_type, object_name, tags) -%}
+{%- for key, value in tags.items() %}
+ALTER {{ object_type }} {{ object_name }} SET TAG "{{ key }}" = '{{ value }}';
+{%- endfor %}
+{%- endmacro -%}
